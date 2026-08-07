@@ -28,6 +28,11 @@ _notify_ids = {}
 _player = None
 
 
+def log(message):
+    """Goes to the journal: journalctl --user -u battery-guard -f"""
+    print(message, flush=True)
+
+
 def find_player():
     """Pick whatever audio CLI this box actually has; None is fine."""
     for cmd, build in (
@@ -63,8 +68,10 @@ def notify(channel, title, body, icon, urgency="normal", sound=None):
         nid = out.stdout.strip()
         if nid.isdigit():
             _notify_ids[channel] = int(nid)
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError) as exc:
+        log(f"notify[{channel}] FAILED: {exc}")
         return
+    log(f"notify[{channel}] {urgency}: {title} | {body}")
     if sound:
         play(sound)
 
@@ -139,8 +146,10 @@ def main():
         elif not drift:
             fired_drift = False
 
-        # Plug/unplug transitions reset the opposite direction's latches.
         if snap["status"] != last_status:
+            log(f"state: {snap['status']} at {p}% "
+                f"(ac={snap['ac_online']}, cap={snap['cap_limit']}%, "
+                f"cap_reached={battlib.cap_reached(snap)})")
             last_status = snap["status"]
 
         time.sleep(max(5, int(cfg["poll_seconds"])))
