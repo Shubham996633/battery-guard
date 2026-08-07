@@ -31,6 +31,9 @@ DEFAULTS = {
     "sound": True,
 }
 
+# How far below target_max still counts as "the cap stopped charging".
+CAP_SLACK = 3
+
 
 def load_config():
     cfg = dict(DEFAULTS)
@@ -139,8 +142,10 @@ def snapshot(cfg=None):
 
     charging = status == "Charging"
     discharging = status == "Discharging"
-    # On AC with the EC limit reached, ASUS reports "Not charging".
-    holding = status in ("Not charging", "Full")
+    on_ac = ac_online()
+    # Charging finished or was stopped by the EC. Firmware disagrees on how to
+    # say it: "Not charging", "Full", or just "Unknown" while sitting on AC.
+    holding = status in ("Not charging", "Full") or (status == "Unknown" and on_ac)
 
     to_target = to_full = to_empty = to_floor = None
     if power and power > 0.05 and full_wh and now_wh is not None:
@@ -164,7 +169,7 @@ def snapshot(cfg=None):
         "charging": charging,
         "discharging": discharging,
         "holding": holding,
-        "ac_online": ac_online(),
+        "ac_online": on_ac,
         "power_w": power,
         "energy_now_wh": now_wh,
         "energy_full_wh": full_wh,
@@ -181,6 +186,23 @@ def snapshot(cfg=None):
         "seconds_to_floor": to_floor,
         "config": cfg,
     }
+
+
+def cap_reached(snap, slack=None):
+    """True once charging has effectively hit the cap.
+
+    Embedded controllers routinely terminate a point or two below the setpoint
+    - an 85% limit stops at 84% on ASUS - so a plain `percent >= target_max`
+    test never fires on that hardware. Charging having *stopped* while on AC
+    near the target is the reliable signal.
+    """
+    slack = CAP_SLACK if slack is None else slack
+    percent = snap.get("percent") or 0
+    target = snap.get("target_max") or DEFAULTS["target_max"]
+    if percent >= target:
+        return True
+    return bool(snap.get("holding") and snap.get("ac_online")
+                and percent >= target - slack)
 
 
 def fmt_duration(seconds):

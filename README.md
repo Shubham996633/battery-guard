@@ -54,8 +54,13 @@ genuinely have to act.
   others. If the file is absent, everything except the cap still works — the installer detects
   this and skips that part.
 
-  Note that some firmware only accepts fixed steps (often 60/80/100) and silently clamps other
-  values. `battery-charge-limit` reads the value back and warns you if that happened.
+  Two firmware quirks worth knowing, both handled:
+
+  - Some controllers only accept fixed steps (often 60/80/100) and silently clamp anything else.
+    `battery-charge-limit` reads the value back and warns you when that happens.
+  - Most controllers stop charging a point or two *below* the setpoint — an 85% limit terminates
+    at 84%. `battery-guard` treats "charging stopped on AC near the target" as reaching the cap,
+    rather than waiting for a number that never arrives.
 
 - **For the tray icon:** an AppIndicator/StatusNotifierItem host. GNOME needs an extension for
   this (`gnome-shell-extension-appindicator`); KDE, Cinnamon, XFCE and Zorin have it built in.
@@ -157,6 +162,15 @@ Three pieces keep the cap alive:
 
 Privileged writes go through `pkexec`, so the GUI raises a normal password prompt. The
 installer deliberately does **not** add a `sudoers` rule.
+
+## Tests
+
+```sh
+python3 tests/test_battlib.py
+```
+
+No dependencies. Covers the cap-detection rule — the part most likely to behave differently on
+other hardware — plus config loading and duration formatting.
 
 ## Cost
 

@@ -114,14 +114,14 @@ def main():
         # --- the way up ---------------------------------------------------
         elif snap["charging"] or snap["holding"]:
             fired_low.clear()
-            if cfg["notify_full"] and p >= tmax and not fired_full:
+            if cfg["notify_full"] and battlib.cap_reached(snap) and not fired_full:
                 if snap["cap_applied"]:
                     title = f"Battery at {p}% - charging stopped"
-                    body = (f"The {tmax}% limit is holding. Safe to leave plugged in, "
-                            f"or unplug for ~{fd(snap['seconds_to_empty']) if snap['seconds_to_empty'] else 'a full session'}.")
+                    near = "" if p >= tmax else " Firmware terminates a little under the setpoint."
+                    body = f"The {tmax}% limit is holding.{near} Safe to leave plugged in."
                 else:
                     title = f"Battery at {p}% - unplug"
-                    body = f"Above your {tmax}% target and the EC limit is not enforcing it."
+                    body = f"At or above your {tmax}% target and the firmware limit is not enforcing it."
                 notify("full", title, body, "battery-full-charged-symbolic",
                        "normal" if snap["cap_applied"] else "critical", sound="done")
                 fired_full = True
