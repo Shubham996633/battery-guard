@@ -1,0 +1,13 @@
+[Unit]
+Description=Battery Guard - charge/drain notifications
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/battery-guardd
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

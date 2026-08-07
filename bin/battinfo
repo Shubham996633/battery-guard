@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""battinfo - terminal battery readout with charge/drain estimates.
+
+  battinfo           pretty readout
+  battinfo --panel   one compact line, e.g. "85% 4:28 to empty"
+  battinfo --json    machine readable
+"""
+
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.expanduser("~/.local/lib/battery-guard"))
+import battlib  # noqa: E402
+
+C = {
+    "reset": "\033[0m",
+    "dim": "\033[2m",
+    "bold": "\033[1m",
+    "green": "\033[92m",
+    "yellow": "\033[93m",
+    "red": "\033[91m",
+    "cyan": "\033[96m",
+}
+if not sys.stdout.isatty():
+    C = {k: "" for k in C}
+
+
+def level_color(snap):
+    p = snap["percent"] or 0
+    if snap["discharging"] and p <= snap["target_min"]:
+        return C["red"]
+    if p > snap["target_max"] + 1 and snap["ac_online"]:
+        return C["yellow"]
+    return C["green"] if not snap["charging"] else C["cyan"]
+
+
+def bar(percent, target_max, width=28):
+    filled = int(round((percent or 0) / 100 * width))
+    marker = int(round(target_max / 100 * width))
+    cells = []
+    for i in range(width):
+        if i == marker:
+            cells.append("|")
+        elif i < filled:
+            cells.append("█")
+        else:
+            cells.append("░")
+    return "".join(cells)
+
+
+def main():
+    args = sys.argv[1:]
+    snap = battlib.snapshot()
+
+    if not snap.get("present"):
+        print("No battery found")
+        return 1
+
+    if "--json" in args:
+        print(json.dumps(snap, indent=2, default=str))
+        return 0
+
+    fd = battlib.fmt_duration
+    p = snap["percent"]
+
+    if "--panel" in args:
+        if snap["charging"]:
+            eta = snap["seconds_to_target"] or snap["seconds_to_full"]
+            print(f"{p}% ↑ {battlib.fmt_clock(eta)} to {snap['target_max']}%")
+        elif snap["discharging"]:
+            print(f"{p}% ↓ {battlib.fmt_clock(snap['seconds_to_empty'])} to empty")
+        else:
+            print(f"{p}% · holding at cap")
+        return 0
+
+    col = level_color(snap)
+    print()
+    print(f"  {col}{C['bold']}{p}%{C['reset']}  {col}{bar(p, snap['target_max'])}{C['reset']}"
+          f"  {C['dim']}(| = {snap['target_max']}% cap){C['reset']}")
+    print()
+
+    watts = f"{snap['power_w']:.1f} W" if snap["power_w"] else "--"
+    print(f"  {C['bold']}State{C['reset']}        {snap['status']}"
+          f"{'  (on AC)' if snap['ac_online'] else '  (on battery)'}   {C['dim']}{watts}{C['reset']}")
+
+    if snap["charging"]:
+        print(f"  {C['bold']}To {snap['target_max']}% cap{C['reset']}  "
+              f"{C['cyan']}{fd(snap['seconds_to_target'])}{C['reset']}"
+              f"   {C['dim']}(to 100%: {fd(snap['seconds_to_full'])}){C['reset']}")
+    elif snap["discharging"]:
+        print(f"  {C['bold']}To empty{C['reset']}     {col}{fd(snap['seconds_to_empty'])}{C['reset']}")
+        print(f"  {C['bold']}To {snap['target_min']}% floor{C['reset']} "
+              f"{fd(snap['seconds_to_floor'])}   {C['dim']}(plug in around then){C['reset']}")
+    else:
+        print(f"  {C['bold']}Charging{C['reset']}     stopped by the {snap['cap_limit']}% EC limit")
+
+    cap_state = (f"{C['green']}{snap['cap_limit']}% enforced{C['reset']}" if snap["cap_applied"]
+                 else f"{C['yellow']}{snap['cap_limit']}% (config wants {snap['target_max']}%){C['reset']}")
+    print(f"  {C['bold']}Charge cap{C['reset']}   {cap_state}")
+
+    if snap["health_pct"] is not None:
+        print(f"  {C['bold']}Health{C['reset']}       {snap['health_pct']:.1f}%"
+              f"   {C['dim']}{snap['energy_full_wh']:.2f} / {snap['energy_design_wh']:.2f} Wh"
+              f" · now {snap['energy_now_wh']:.2f} Wh{C['reset']}")
+    cycles = snap["cycle_count"]
+    cyc_txt = str(cycles) if cycles else "not reported by this firmware"
+    print(f"  {C['bold']}Cycles{C['reset']}       {C['dim']}{cyc_txt}{C['reset']}")
+    print()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

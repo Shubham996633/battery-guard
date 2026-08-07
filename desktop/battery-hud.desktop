@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Battery
+GenericName=Battery gauge
+Comment=Charge cap, time to full, time to empty and pack health
+Exec=@HOME@/.local/bin/battery-hud
+Icon=battery-level-90-charged-symbolic
+Terminal=false
+Categories=System;Monitor;
+Keywords=battery;charge;power;health;
+StartupNotify=true

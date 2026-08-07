@@ -1,0 +1,9 @@
+{
+  "target_max": 85,
+  "target_min": 20,
+  "low_steps": [20, 15, 10, 5],
+  "notify_full": true,
+  "notify_cap_drift": true,
+  "poll_seconds": 20,
+  "sound": true
+}

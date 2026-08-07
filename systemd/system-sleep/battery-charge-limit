@@ -1,0 +1,6 @@
+#!/bin/sh
+# Re-apply the charge limit after resume: some EC firmware drops the
+# threshold back to 100 coming out of S3/hibernate.
+[ "$1" = post ] || exit 0
+[ -x /usr/local/sbin/battery-charge-limit ] || exit 0
+/usr/local/sbin/battery-charge-limit --apply >/dev/null 2>&1 || true

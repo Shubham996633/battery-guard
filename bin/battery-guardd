@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+"""battery-guardd - desktop notifications for battery limits.
+
+Runs as a user systemd service. Notifies on the way down (configurable
+steps, default 20/15/10/5) and once when charging reaches the cap.
+Each channel reuses one notification id so nothing stacks up, and every
+alert has hysteresis so it cannot re-fire while hovering on a boundary.
+"""
+
+import os
+import shutil
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.expanduser("~/.local/lib/battery-guard"))
+import battlib  # noqa: E402
+
+APP = "Battery Guard"
+HYSTERESIS = 3  # percent you must climb back above before a step re-arms
+
+SOUND_FILES = {
+    "warning": "/usr/share/sounds/freedesktop/stereo/dialog-warning.oga",
+    "done": "/usr/share/sounds/freedesktop/stereo/complete.oga",
+}
+
+_notify_ids = {}
+_player = None
+
+
+def find_player():
+    """Pick whatever audio CLI this box actually has; None is fine."""
+    for cmd, build in (
+        ("canberra-gtk-play", lambda f: ["canberra-gtk-play", "-f", f]),
+        ("pw-play", lambda f: ["pw-play", f]),
+        ("paplay", lambda f: ["paplay", f]),
+        ("gst-play-1.0", lambda f: ["gst-play-1.0", "--no-interactive", f]),
+        ("ffplay", lambda f: ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", f]),
+    ):
+        if shutil.which(cmd):
+            return build
+    return None
+
+
+def play(kind):
+    path = SOUND_FILES.get(kind)
+    if not _player or not path or not os.path.exists(path):
+        return
+    try:
+        subprocess.Popen(_player(path), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
+
+
+def notify(channel, title, body, icon, urgency="normal", sound=None):
+    cmd = ["notify-send", "-a", APP, "-i", icon, "-u", urgency, "-p",
+           "-h", "string:desktop-entry:battery-hud"]
+    if channel in _notify_ids:
+        cmd += ["-r", str(_notify_ids[channel])]
+    cmd += [title, body]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        nid = out.stdout.strip()
+        if nid.isdigit():
+            _notify_ids[channel] = int(nid)
+    except (OSError, subprocess.SubprocessError):
+        return
+    if sound:
+        play(sound)
+
+
+def low_urgency(step, floor):
+    return "critical" if step <= max(10, floor // 2) else "normal"
+
+
+def main():
+    global _player
+    _player = find_player()
+
+    fired_low = set()
+    fired_full = False
+    fired_drift = False
+    last_status = None
+
+    while True:
+        cfg = battlib.load_config()
+        snap = battlib.snapshot(cfg)
+        if not snap.get("present"):
+            time.sleep(60)
+            continue
+
+        p = snap["percent"] or 0
+        tmax, tmin = snap["target_max"], snap["target_min"]
+        fd = battlib.fmt_duration
+
+        # --- the way down -------------------------------------------------
+        if snap["discharging"]:
+            fired_full = False
+            for step in cfg["low_steps"]:
+                if p <= step and step not in fired_low:
+                    eta = fd(snap["seconds_to_empty"])
+                    if step <= 5:
+                        title = f"Battery critical - {p}%"
+                        body = f"About {eta} left. Plug in now."
+                    else:
+                        title = f"Battery low - {p}%"
+                        body = f"About {eta} left before empty. Charge to protect the cells."
+                    notify("low", title, body, "battery-caution-symbolic",
+                           low_urgency(step, tmin), sound="warning")
+                    fired_low.add(step)
+            # Re-arm a step only once we are comfortably back above it.
+            fired_low = {s for s in fired_low if p <= s + HYSTERESIS}
+
+        # --- the way up ---------------------------------------------------
+        elif snap["charging"] or snap["holding"]:
+            fired_low.clear()
+            if cfg["notify_full"] and p >= tmax and not fired_full:
+                if snap["cap_applied"]:
+                    title = f"Battery at {p}% - charging stopped"
+                    body = (f"The {tmax}% limit is holding. Safe to leave plugged in, "
+                            f"or unplug for ~{fd(snap['seconds_to_empty']) if snap['seconds_to_empty'] else 'a full session'}.")
+                else:
+                    title = f"Battery at {p}% - unplug"
+                    body = f"Above your {tmax}% target and the EC limit is not enforcing it."
+                notify("full", title, body, "battery-full-charged-symbolic",
+                       "normal" if snap["cap_applied"] else "critical", sound="done")
+                fired_full = True
+            if p < tmax - HYSTERESIS:
+                fired_full = False
+
+        # --- the cap itself slipped --------------------------------------
+        drift = cfg["notify_cap_drift"] and snap["cap_limit"] is not None and not snap["cap_applied"]
+        if drift and not fired_drift:
+            notify("drift", "Charge limit not applied",
+                   f"EC limit is {snap['cap_limit']}%, your target is {tmax}%. "
+                   f"Run: sudo battery-charge-limit {tmax}",
+                   "dialog-warning-symbolic", "critical", sound="warning")
+            fired_drift = True
+        elif not drift:
+            fired_drift = False
+
+        # Plug/unplug transitions reset the opposite direction's latches.
+        if snap["status"] != last_status:
+            last_status = snap["status"]
+
+        time.sleep(max(5, int(cfg["poll_seconds"])))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass

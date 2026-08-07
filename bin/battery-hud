@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+"""battery-hud - a live GTK4 battery gauge for Zorin/GNOME.
+
+Shows what the stock indicator does not: time to reach the charge cap,
+time to empty, time until the plug-in floor, live wattage, pack health,
+and one-click control of the EC charge limit.
+"""
+
+import math
+import os
+import shutil
+import subprocess
+import sys
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, GLib, Gtk  # noqa: E402
+
+sys.path.insert(0, os.path.expanduser("~/.local/lib/battery-guard"))
+import battlib  # noqa: E402
+
+REFRESH_SECONDS = 2
+LIMIT_TOOL = "/usr/local/sbin/battery-charge-limit"
+
+GREEN = (0.18, 0.76, 0.42)
+CYAN = (0.20, 0.68, 0.94)
+AMBER = (0.95, 0.68, 0.15)
+RED = (0.92, 0.28, 0.28)
+
+
+class Gauge(Gtk.DrawingArea):
+    """Ring gauge: filled arc = charge, notch = configured cap."""
+
+    def __init__(self):
+        super().__init__()
+        self.snap = {}
+        self.set_content_width(220)
+        self.set_content_height(220)
+        self.set_draw_func(self._draw)
+
+    def update(self, snap):
+        self.snap = snap
+        self.queue_draw()
+
+    def _color(self):
+        s = self.snap
+        p = s.get("percent") or 0
+        if s.get("discharging") and p <= s.get("target_min", 20):
+            return RED
+        if s.get("charging"):
+            return CYAN
+        if s.get("ac_online") and p > s.get("target_max", 85) + 1 and not s.get("cap_applied"):
+            return AMBER
+        return GREEN
+
+    def _draw(self, _area, ctx, width, height, *_):
+        s = self.snap
+        percent = s.get("percent") or 0
+        cx, cy = width / 2, height / 2
+        radius = min(width, height) / 2 - 16
+        thickness = 16
+        start = -math.pi / 2
+
+        dark = Adw.StyleManager.get_default().get_dark()
+        track = (1, 1, 1, 0.12) if dark else (0, 0, 0, 0.10)
+        text_rgb = (0.96, 0.96, 0.96) if dark else (0.13, 0.13, 0.13)
+
+        ctx.set_line_width(thickness)
+        ctx.set_line_cap(1)  # round
+
+        ctx.set_source_rgba(*track)
+        ctx.arc(cx, cy, radius, 0, 2 * math.pi)
+        ctx.stroke()
+
+        if percent > 0:
+            ctx.set_source_rgb(*self._color())
+            ctx.arc(cx, cy, radius, start, start + 2 * math.pi * percent / 100)
+            ctx.stroke()
+
+        # Cap notch.
+        cap = s.get("target_max")
+        if cap:
+            ang = start + 2 * math.pi * cap / 100
+            ctx.set_line_width(3)
+            ctx.set_source_rgba(*(text_rgb + (0.55,)))
+            ctx.move_to(cx + math.cos(ang) * (radius - thickness / 2 - 4),
+                        cy + math.sin(ang) * (radius - thickness / 2 - 4))
+            ctx.line_to(cx + math.cos(ang) * (radius + thickness / 2 + 4),
+                        cy + math.sin(ang) * (radius + thickness / 2 + 4))
+            ctx.stroke()
+
+        ctx.set_source_rgb(*text_rgb)
+        ctx.select_font_face("Cantarell", 0, 1)
+        label = f"{percent}%"
+        ctx.set_font_size(46)
+        ext = ctx.text_extents(label)
+        ctx.move_to(cx - ext.width / 2 - ext.x_bearing, cy + 6)
+        ctx.show_text(label)
+
+        sub = s.get("status", "")
+        if s.get("holding"):
+            sub = "at cap"
+        ctx.select_font_face("Cantarell", 0, 0)
+        ctx.set_font_size(13)
+        ext = ctx.text_extents(sub)
+        ctx.move_to(cx - ext.width / 2 - ext.x_bearing, cy + 30)
+        ctx.show_text(sub.lower())
+
+
+class Row(Adw.ActionRow):
+    def __init__(self, title):
+        super().__init__(title=title)
+        self.value = Gtk.Label(css_classes=["numeric"])
+        self.add_suffix(self.value)
+
+    def set(self, text):
+        self.value.set_label(text)
+
+
+class Window(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="Battery", default_width=400,
+                         default_height=640)
+
+        self.gauge = Gauge()
+        self.headline = Gtk.Label(css_classes=["title-4"], wrap=True, justify=Gtk.Justification.CENTER)
+        self.sub = Gtk.Label(css_classes=["dim-label"], wrap=True, justify=Gtk.Justification.CENTER)
+
+        self.r_eta = Row("Time remaining")
+        self.r_secondary = Row("Also")
+        self.r_power = Row("Power draw")
+        self.r_energy = Row("Charge held")
+
+        self.r_cap = Row("EC charge limit")
+        self.r_health = Row("Health")
+        self.r_cycles = Row("Cycles")
+
+        live = Adw.PreferencesGroup(title="Live")
+        for r in (self.r_eta, self.r_secondary, self.r_power, self.r_energy):
+            live.add(r)
+
+        pack = Adw.PreferencesGroup(title="Pack")
+        for r in (self.r_cap, self.r_health, self.r_cycles):
+            pack.add(r)
+
+        cfg = battlib.load_config()
+        controls = Adw.PreferencesGroup(
+            title="Charge limit",
+            description="Enforced by the laptop's embedded controller, so it "
+                        "applies even at the login screen or in Windows-free sleep.")
+        btn_row = Adw.ActionRow(title="Set limit")
+        box = Gtk.Box(spacing=6, valign=Gtk.Align.CENTER)
+        for value, label in ((60, "60%"), (int(cfg["target_max"]), f"{int(cfg['target_max'])}%"), (100, "100%")):
+            b = Gtk.Button(label=label)
+            b.connect("clicked", self._set_limit, value)
+            box.append(b)
+        btn_row.add_suffix(box)
+        controls.add(btn_row)
+        self.status_label = Gtk.Label(css_classes=["dim-label", "caption"], wrap=True, xalign=0)
+        controls.add(Adw.ActionRow(child=self.status_label))
+
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14,
+                       margin_top=8, margin_bottom=24, margin_start=16, margin_end=16)
+        body.append(self.gauge)
+        body.append(self.headline)
+        body.append(self.sub)
+        body.append(live)
+        body.append(pack)
+        body.append(controls)
+
+        scroller = Gtk.ScrolledWindow(child=body, vexpand=True,
+                                      hscrollbar_policy=Gtk.PolicyType.NEVER)
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        root.append(Adw.HeaderBar(show_title=True))
+        root.append(scroller)
+        self.set_content(root)
+
+        self.refresh()
+        GLib.timeout_add_seconds(REFRESH_SECONDS, self.refresh)
+
+    def _set_limit(self, _btn, value):
+        for cmd in (["sudo", "-n", LIMIT_TOOL, str(value)],
+                    ["pkexec", LIMIT_TOOL, str(value)]):
+            if not shutil.which(cmd[0]):
+                continue
+            try:
+                res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+                if res.returncode == 0:
+                    self.status_label.set_label(f"Limit set to {value}%.")
+                    self.refresh()
+                    return
+            except (OSError, subprocess.SubprocessError):
+                continue
+        self.status_label.set_label(
+            f"Could not set it automatically. Run: sudo {LIMIT_TOOL} {value}")
+
+    def refresh(self):
+        snap = battlib.snapshot()
+        if not snap.get("present"):
+            self.headline.set_label("No battery detected")
+            return True
+
+        self.gauge.update(snap)
+        fd = battlib.fmt_duration
+        tmax, tmin = snap["target_max"], snap["target_min"]
+
+        if snap["charging"]:
+            self.headline.set_label(f"Charging to the {tmax}% cap")
+            self.sub.set_label(f"Then charging stops on its own — nothing to unplug.")
+            self.r_eta.set_title(f"To {tmax}% cap")
+            self.r_eta.set(fd(snap["seconds_to_target"]))
+            self.r_secondary.set_title("To 100% (if uncapped)")
+            self.r_secondary.set(fd(snap["seconds_to_full"]))
+        elif snap["discharging"]:
+            self.headline.set_label(f"On battery — {fd(snap['seconds_to_empty'])} left")
+            self.sub.set_label(f"Plug in when it nears {tmin}% to keep the pack out of deep discharge.")
+            self.r_eta.set_title("To empty")
+            self.r_eta.set(fd(snap["seconds_to_empty"]))
+            self.r_secondary.set_title(f"To {tmin}% floor")
+            self.r_secondary.set(fd(snap["seconds_to_floor"]))
+        else:
+            self.headline.set_label(f"Holding at {snap['percent']}%")
+            self.sub.set_label(f"The {snap['cap_limit']}% EC limit stopped charging. "
+                               "This is the healthiest state to sit in on AC.")
+            self.r_eta.set_title("Charging")
+            self.r_eta.set("stopped at cap")
+            self.r_secondary.set_title("Runtime if unplugged")
+            self.r_secondary.set(fd(snap["seconds_to_empty"]) if snap["seconds_to_empty"] else "--")
+
+        self.r_power.set(f"{snap['power_w']:.1f} W" if snap["power_w"] else "idle")
+        if snap["energy_now_wh"] and snap["energy_full_wh"]:
+            self.r_energy.set(f"{snap['energy_now_wh']:.1f} / {snap['energy_full_wh']:.1f} Wh")
+
+        cap = snap["cap_limit"]
+        self.r_cap.set(f"{cap}%" + ("" if snap["cap_applied"] else f"  (target {tmax}%)"))
+        self.r_health.set(f"{snap['health_pct']:.1f}%" if snap["health_pct"] is not None else "--")
+        design = snap["energy_design_wh"]
+        if design:
+            self.r_health.set_subtitle(f"{snap['energy_full_wh']:.2f} of {design:.2f} Wh design capacity")
+        self.r_cycles.set(str(snap["cycle_count"]) if snap["cycle_count"] else "not reported")
+        self.r_cycles.set_subtitle("This firmware does not report cycle count"
+                                   if not snap["cycle_count"] else "")
+        return True
+
+
+class App(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id="io.github.shubham996633.BatteryGuard")
+
+    def do_activate(self):
+        win = self.props.active_window or Window(self)
+        win.present()
+
+
+if __name__ == "__main__":
+    sys.exit(App().run(sys.argv))

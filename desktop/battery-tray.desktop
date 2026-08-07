@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Battery Tray
+GenericName=Battery panel indicator
+Comment=Show the battery time and charge-cap icon in the panel
+Exec=systemctl --user restart battery-tray.service
+Icon=battery-good-symbolic
+Terminal=false
+Categories=System;Monitor;
+Keywords=battery;tray;indicator;panel;charge;
+StartupNotify=false

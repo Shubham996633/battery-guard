@@ -1,0 +1,64 @@
+#!/bin/bash
+# battery-charge-limit - set the EC charge-stop threshold and remember it.
+#
+#   battery-charge-limit 85       set and persist
+#   battery-charge-limit --apply  re-apply the persisted value (boot/resume)
+#   battery-charge-limit --show   print current thresholds
+#
+# The threshold is enforced by the embedded controller (asus_wmi), so it
+# holds across reboots of the OS, at the login screen, and while suspended.
+set -euo pipefail
+
+DEFAULTS=/etc/default/battery-charge-limit
+GLOB=(/sys/class/power_supply/BAT*/charge_control_end_threshold)
+
+die() { echo "battery-charge-limit: $*" >&2; exit 2; }
+
+show() {
+    local found=0
+    for f in "${GLOB[@]}"; do
+        [ -e "$f" ] || continue
+        found=1
+        echo "$(basename "$(dirname "$f")"): $(cat "$f")%"
+    done
+    [ "$found" = 1 ] || die "no charge_control_end_threshold on this machine"
+}
+
+apply() {
+    local value="$1" found=0
+    for f in "${GLOB[@]}"; do
+        [ -e "$f" ] || continue
+        found=1
+        if ! echo "$value" > "$f" 2>/dev/null; then
+            echo "battery-charge-limit: failed to write $f" >&2
+            continue
+        fi
+        local got
+        got="$(cat "$f")"
+        echo "$(basename "$(dirname "$f")"): limit $got%"
+        [ "$got" = "$value" ] || echo "  note: EC clamped $value -> $got (firmware only accepts certain steps)" >&2
+    done
+    [ "$found" = 1 ] || die "no charge_control_end_threshold on this machine"
+}
+
+case "${1:-}" in
+    --show|-s)
+        show
+        ;;
+    --apply|-a)
+        value=85
+        # shellcheck source=/dev/null
+        [ -r "$DEFAULTS" ] && . "$DEFAULTS"
+        value="${BATTERY_CHARGE_LIMIT:-$value}"
+        [[ "$value" =~ ^([0-9]|[1-9][0-9]|100)$ ]] || die "bad value in $DEFAULTS: $value"
+        apply "$value"
+        ;;
+    "")
+        die "usage: battery-charge-limit <0-100> | --apply | --show"
+        ;;
+    *)
+        [[ "$1" =~ ^([0-9]|[1-9][0-9]|100)$ ]] || die "value must be an integer 0-100, got: $1"
+        apply "$1"
+        printf 'BATTERY_CHARGE_LIMIT=%s\n' "$1" > "$DEFAULTS"
+        ;;
+esac

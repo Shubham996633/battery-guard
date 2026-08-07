@@ -1,0 +1,15 @@
+[Unit]
+Description=Battery Tray - panel indicator for charge time and cap
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/battery-tray
+# Quitting from the tray menu exits cleanly, so it stays quit on purpose.
+# Only a crash brings it back automatically.
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

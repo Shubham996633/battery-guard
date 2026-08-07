@@ -1,0 +1,7 @@
+{
+  "uuid": "battery-time@local",
+  "name": "Battery Time & Cap",
+  "description": "Shows remaining time (not just percent) in the panel, plus time to the charge cap, pack health, and one-click EC charge-limit control.",
+  "shell-version": ["45", "46", "47", "48"],
+  "version": 1
+}
