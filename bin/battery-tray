@@ -13,9 +13,15 @@ import sys
 import gi
 
 gi.require_version("Gtk", "3.0")
-gi.require_version("AyatanaAppIndicator3", "0.1")
-from gi.repository import AyatanaAppIndicator3 as AppIndicator  # noqa: E402
 from gi.repository import GLib, Gtk  # noqa: E402
+
+# Distros ship one of these two libraries, and they work the same way.
+try:
+    gi.require_version("AyatanaAppIndicator3", "0.1")
+    from gi.repository import AyatanaAppIndicator3 as AppIndicator  # noqa: E402
+except (ValueError, ImportError):
+    gi.require_version("AppIndicator3", "0.1")
+    from gi.repository import AppIndicator3 as AppIndicator  # noqa: E402
 
 sys.path.insert(0, os.path.expanduser("~/.local/lib/battery-guard"))
 import battlib  # noqa: E402
@@ -23,6 +29,7 @@ import battlib  # noqa: E402
 REFRESH_SECONDS = 10
 LIMIT_TOOL = "/usr/local/sbin/battery-charge-limit"
 HUD = os.path.expanduser("~/.local/bin/battery-hud")
+ALERTS = os.path.expanduser("~/.local/bin/battery-guardd")
 
 
 def icon_for(snap):
@@ -63,10 +70,12 @@ class Tray:
 
         cfg = battlib.load_config()
         target = int(cfg["target_max"])
-        self._action(f"Limit charging to {target}%", lambda *_: self._set_limit(target))
-        self._action("Allow full charge (travel)", lambda *_: self._set_limit(100))
+        if battlib.snapshot(cfg).get("cap_limit") is not None:
+            self._action(f"Limit charging to {target}%", lambda *_: self._set_limit(target))
+            self._action("Allow full charge (travel)", lambda *_: self._set_limit(100))
         self.menu.append(Gtk.SeparatorMenuItem())
         self._action("Open Battery app", lambda *_: self._spawn([HUD]))
+        self._action("Test alert", lambda *_: self._spawn([ALERTS, "--test"]))
         self._action("Refresh now", lambda *_: self.refresh())
         self._action("Quit tray", lambda *_: Gtk.main_quit())
 
@@ -108,16 +117,21 @@ class Tray:
         fd, fc = battlib.fmt_duration, battlib.fmt_clock
         p = snap["percent"]
         tmax, tmin = snap["target_max"], snap["target_min"]
+        has_cap = snap["cap_limit"] is not None
 
         if snap["charging"]:
             self.indicator.set_label(f"{p}% ↑ {fc(snap['seconds_to_target'])}", "100% ↑ 0:00")
-            self.m_headline.set_label(f"Charging — {fd(snap['seconds_to_target'])} to the {tmax}% cap")
+            goal = "cap" if has_cap else "target"
+            self.m_headline.set_label(f"Charging — {fd(snap['seconds_to_target'])} to the {tmax}% {goal}")
         elif snap["discharging"]:
             self.indicator.set_label(f"{p}% ↓ {fc(snap['seconds_to_empty'])}", "100% ↓ 0:00")
             self.m_headline.set_label(f"On battery — {fd(snap['seconds_to_empty'])} to empty")
-        else:
+        elif has_cap:
             self.indicator.set_label(f"{p}% · cap", "100% · cap")
             self.m_headline.set_label(f"Holding at {p}% — charging stopped by the cap")
+        else:
+            self.indicator.set_label(f"{p}% · AC", "100% · cap")
+            self.m_headline.set_label(f"Plugged in at {p}% — not charging")
 
         watts = f"{snap['power_w']:.1f} W" if snap["power_w"] else "idle"
         if snap["discharging"]:
@@ -131,9 +145,12 @@ class Tray:
             wh = f" ({snap['energy_full_wh']:.2f} / {snap['energy_design_wh']:.2f} Wh)"
         self.m_health.set_label(f"Health {health}{wh}")
 
-        self.m_cap.set_label(
-            f"Charge limit {snap['cap_limit']}% (firmware enforced)" if snap["cap_applied"]
-            else f"Charge limit {snap['cap_limit']}% — target is {tmax}%")
+        if not has_cap:
+            self.m_cap.set_label(f"No charge limit on this laptop — alerts you at {tmax}%")
+        elif snap["cap_applied"]:
+            self.m_cap.set_label(f"Charge limit {snap['cap_limit']}% (firmware enforced)")
+        else:
+            self.m_cap.set_label(f"Charge limit {snap['cap_limit']}% — target is {tmax}%")
 
         self.indicator.set_icon_full(icon_for(snap), f"Battery {p}%")
         return True
