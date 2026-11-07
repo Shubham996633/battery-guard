@@ -5,8 +5,10 @@ Covers the cap-detection rule, which is the part most likely to be wrong on
 hardware other than the author's, and the duration formatting.
 """
 
+import os
 import pathlib
 import sys
+import tempfile
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "lib"))
 import battlib  # noqa: E402
@@ -67,6 +69,57 @@ print("fmt_clock")
 check("none", battlib.fmt_clock(None), "--:--")
 check("hours and minutes", battlib.fmt_clock(8 * 3600 + 33 * 60), "8:33")
 check("under an hour", battlib.fmt_clock(7 * 60), "0:07")
+
+print("reminder_due")
+check("nothing fired yet", battlib.reminder_due(None, 1000, 5), False)
+check("too soon", battlib.reminder_due(1000, 1299, 5), False)
+check("exactly on time", battlib.reminder_due(1000, 1300, 5), True)
+check("0 minutes means never repeat", battlib.reminder_due(1000, 99999, 0), False)
+
+print("health history")
+with tempfile.TemporaryDirectory() as folder:
+    history = pathlib.Path(folder) / "nested" / "health.csv"
+    check("empty when there is no file", battlib.read_health_history(history), [])
+    check("first reading of the day is saved",
+          battlib.record_health({"health_pct": 83.64}, "2026-11-07", history), True)
+    check("second reading that day is not",
+          battlib.record_health({"health_pct": 83.0}, "2026-11-07", history), False)
+    check("next day is saved",
+          battlib.record_health({"health_pct": 83.2}, "2026-11-08", history), True)
+    check("firmware without health data saves nothing",
+          battlib.record_health({"health_pct": None}, "2026-11-09", history), False)
+    check("reads oldest first",
+          battlib.read_health_history(history), [("2026-11-07", 83.6), ("2026-11-08", 83.2)])
+    with history.open("a") as handle:
+        handle.write("garbage\n2026-11-09,not-a-number\n")
+    check("bad lines are skipped", len(battlib.read_health_history(history)), 2)
+
+print("sparkline")
+check("empty", battlib.sparkline([]), "")
+check("rises", battlib.sparkline([1, 2, 3]), "▁▅█")
+check("flat does not crash", battlib.sparkline([80, 80]), "▁▁")
+
+print("busiest_apps")
+ticks = battlib.CLOCK_TICKS_PER_SECOND
+before = {1: ("firefox", 0), 2: ("firefox", 0), 3: ("code", 0), 4: ("idle", 7)}
+after = {1: ("firefox", ticks), 2: ("firefox", ticks), 3: ("code", ticks // 2), 4: ("idle", 7)}
+check("adds same-named processes and sorts",
+      battlib.busiest_apps(before, after, 2), [("firefox", 100.0), ("code", 25.0)])
+check("a counter going backwards is not negative",
+      battlib.busiest_apps({1: ("a", 50)}, {1: ("a", 10)}, 1), [])
+check("a reused pid counts only the new program",
+      battlib.busiest_apps({1: ("old", 500)}, {1: ("new", ticks)}, 1), [("new", 100.0)])
+check("top limits the list",
+      len(battlib.busiest_apps({}, {i: (f"p{i}", 10) for i in range(9)}, 1, top=3)), 3)
+with tempfile.TemporaryDirectory() as folder:
+    for pid, stat in (("10", "10 (my (odd) app) S " + "0 " * 10 + "7 3 " + "0 " * 8 + "5 0"),
+                      ("11", "11 (kworker/0) S " + "0 " * 10 + "9 9 " + "0 " * 8 + "0 0"),
+                      ("12", "12 (cut")):
+        os.mkdir(f"{folder}/{pid}")
+        pathlib.Path(f"{folder}/{pid}/stat").write_text(stat)
+    os.mkdir(f"{folder}/notapid")
+    check("parses odd names, skips kernel threads and bad data",
+          battlib.read_cpu_ticks(folder), {10: ("my (odd) app", 10)})
 
 print("load_config")
 cfg = battlib.load_config()

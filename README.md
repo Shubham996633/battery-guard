@@ -39,6 +39,10 @@ genuinely have to act.
 | **Desktop app** | A ring gauge with every estimate, live at 2 s. |
 | **`battinfo`** | The terminal readout above. `--json` for scripting, `--panel` for status bars. |
 | **Drift detection** | If firmware resets the cap, you get told, instead of silently charging to 100% again. |
+| **No firmware limit?** | Laptops without the driver get an urgent unplug alert at your target, repeating every 5 minutes until you unplug. Below 10%, low-battery alerts repeat the same way. |
+| **Health history** | Saves one health reading a day. See the graph in the window or run `battinfo --history`. |
+| **Busiest apps** | Shows which apps are working the CPU hardest, in the window or with `battinfo --apps`. |
+| **Charger sounds** | A short sound when the charger is plugged in or pulled out. |
 
 ## Requirements
 
@@ -92,6 +96,9 @@ config, and prints the readout when it finishes. Everything user-level goes to `
 battinfo                 # terminal readout
 battinfo --json          # machine readable
 battinfo --panel         # one compact line for a status bar
+battinfo --history       # battery health over time
+battinfo --apps          # which apps are working the CPU hardest
+battery-guardd --test    # send a sample alert and sound
 ```
 
 - **Window:** app menu → *Battery*
@@ -130,7 +137,9 @@ rather than letting you believe a limit is active when it is not.
 | `target_max` | Charge cap. Also where the "charging stopped" notification fires. |
 | `target_min` | The floor used for the "time until you should plug in" estimate. |
 | `low_steps` | Percentages that raise a notification while discharging. |
-| `notify_full` | Notify once when charging reaches `target_max`. |
+| `notify_full` | Notify when charging reaches `target_max`. |
+| `reminder_minutes` | Repeat urgent alerts this often until dealt with. `0` means only once. Default 5. |
+| `plug_sounds` | Play a sound when the charger is plugged in or pulled out. Default on. |
 | `notify_cap_drift` | Warn if the firmware limit no longer matches `target_max`. |
 | `poll_seconds` | How often the daemon checks. |
 | `sound` | Play a sound with alerts, if a player is available. |
@@ -167,6 +176,7 @@ installer deliberately does **not** add a `sudoers` rule.
 
 ```sh
 python3 tests/test_battlib.py
+python3 tests/test_alerts.py
 ```
 
 No dependencies. Covers the cap-detection rule — the part most likely to behave differently on

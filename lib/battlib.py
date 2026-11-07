@@ -14,6 +14,10 @@ SYSFS = Path("/sys/class/power_supply")
 
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "battery-guard"
 CONFIG_PATH = CONFIG_DIR / "config.json"
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "battery-guard"
+HEALTH_HISTORY_PATH = STATE_DIR / "health.csv"
+CLOCK_TICKS_PER_SECOND = os.sysconf("SC_CLK_TCK")
+SPARK_LEVELS = "▁▂▃▄▅▆▇█"
 
 DEFAULTS = {
     # Stop charging here. Written to the EC, so it is enforced in firmware.
@@ -29,6 +33,10 @@ DEFAULTS = {
     "notify_cap_drift": True,
     "poll_seconds": 20,
     "sound": True,
+    # Sound when the charger is plugged in or pulled out.
+    "plug_sounds": True,
+    # Repeat urgent alerts this often until dealt with. 0 means only once.
+    "reminder_minutes": 5,
 }
 
 # How far below target_max still counts as "the cap stopped charging".
@@ -186,6 +194,97 @@ def snapshot(cfg=None):
         "seconds_to_floor": to_floor,
         "config": cfg,
     }
+
+
+def read_health_history(path=None):
+    """Return [(date string, health percent)], oldest first. Bad lines are skipped."""
+    rows = []
+    try:
+        lines = Path(path or HEALTH_HISTORY_PATH).read_text().splitlines()
+    except OSError:
+        return rows
+    for line in lines:
+        date, _, value = line.partition(",")
+        try:
+            rows.append((date, float(value)))
+        except ValueError:
+            continue
+    return rows
+
+
+def record_health(snap, today, path=None):
+    """Add today's health to the history, once a day. Returns True if it wrote."""
+    health = snap.get("health_pct")
+    if health is None:
+        return False
+    path = Path(path or HEALTH_HISTORY_PATH)
+    history = read_health_history(path)
+    if history and history[-1][0] == today:
+        return False
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as handle:
+            handle.write(f"{today},{health:.1f}\n")
+    except OSError:
+        return False
+    return True
+
+
+def sparkline(values):
+    """Text graph of values, one character each."""
+    if not values:
+        return ""
+    low, high = min(values), max(values)
+    span = (high - low) or 1
+    top = len(SPARK_LEVELS) - 1
+    return "".join(SPARK_LEVELS[round((v - low) / span * top)] for v in values)
+
+
+def read_cpu_ticks(proc="/proc"):
+    """Return {pid: (process name, CPU ticks used)} for running user programs."""
+    usage = {}
+    try:
+        pids = [name for name in os.listdir(proc) if name.isdigit()]
+    except OSError:
+        return usage
+    for pid in pids:
+        try:
+            with open(f"{proc}/{pid}/stat") as handle:
+                stat = handle.read()
+            # The name is in brackets and can itself contain spaces or brackets.
+            name = stat[stat.index("(") + 1:stat.rindex(")")]
+            fields = stat[stat.rindex(")") + 2:].split()
+            ticks = int(fields[11]) + int(fields[12])  # user time + system time
+            memory_pages = int(fields[21])
+        except (OSError, ValueError, IndexError):
+            continue  # it exited while we were reading
+        if memory_pages > 0:  # kernel threads have no memory of their own
+            usage[int(pid)] = (name, ticks)
+    return usage
+
+
+def busiest_apps(before, after, seconds, top=5):
+    """Return [(name, percent of one CPU core)] between two read_cpu_ticks samples.
+
+    Processes with the same name are added together, so a browser's many
+    processes show as one line.
+    """
+    used = {}
+    for pid, (name, ticks) in after.items():
+        old_name, old_ticks = before.get(pid, (name, 0))
+        if old_name != name:  # the pid was reused by another program
+            old_ticks = 0
+        used[name] = used.get(name, 0) + max(0, ticks - old_ticks)
+    percent = ((name, ticks / CLOCK_TICKS_PER_SECOND / seconds * 100)
+               for name, ticks in used.items() if ticks > 0)
+    return sorted(percent, key=lambda item: item[1], reverse=True)[:top]
+
+
+def reminder_due(last_alert, now, minutes):
+    """True when an alert that already fired should repeat."""
+    if last_alert is None or minutes <= 0:
+        return False
+    return now - last_alert >= minutes * 60
 
 
 def cap_reached(snap, slack=None):
