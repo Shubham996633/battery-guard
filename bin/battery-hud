@@ -22,6 +22,8 @@ sys.path.insert(0, os.path.expanduser("~/.local/lib/battery-guard"))
 import battlib  # noqa: E402
 
 REFRESH_SECONDS = 2
+APPS_REFRESH_SECONDS = 10
+APP_ROWS = 5
 LIMIT_TOOL = "/usr/local/sbin/battery-charge-limit"
 
 GREEN = (0.18, 0.76, 0.42)
@@ -100,13 +102,69 @@ class Gauge(Gtk.DrawingArea):
         ctx.show_text(label)
 
         sub = s.get("status", "")
-        if s.get("holding"):
+        if s.get("holding") and s.get("cap_limit") is not None:
             sub = "at cap"
         ctx.select_font_face("Cantarell", 0, 0)
         ctx.set_font_size(13)
         ext = ctx.text_extents(sub)
         ctx.move_to(cx - ext.width / 2 - ext.x_bearing, cy + 30)
         ctx.show_text(sub.lower())
+
+
+class HealthChart(Gtk.DrawingArea):
+    """Battery health over time, one point per day."""
+
+    def __init__(self):
+        super().__init__()
+        self.history = []
+        self.set_content_height(120)
+        self.set_draw_func(self._draw)
+
+    def update(self, history):
+        self.history = history
+        self.queue_draw()
+
+    def _draw(self, _area, ctx, width, height, *_):
+        dark = Adw.StyleManager.get_default().get_dark()
+        text = (0.96, 0.96, 0.96) if dark else (0.13, 0.13, 0.13)
+        history = self.history
+        ctx.select_font_face("Cantarell", 0, 0)
+        ctx.set_font_size(12)
+        ctx.set_source_rgba(*text, 0.65)
+        if len(history) < 2:
+            message = "A reading is saved each day. The graph starts tomorrow."
+            ext = ctx.text_extents(message)
+            ctx.move_to((width - ext.width) / 2, height / 2)
+            ctx.show_text(message)
+            return
+
+        values = [value for _, value in history]
+        low, high = min(values) - 1, max(values) + 1
+        left, right, top, bottom = 42, 10, 10, 26
+        plot_w, plot_h = width - left - right, height - top - bottom
+
+        def x_at(index):
+            return left + plot_w * index / (len(values) - 1)
+
+        def y_at(value):
+            return top + plot_h * (high - value) / (high - low)
+
+        ctx.move_to(4, y_at(high) + 10)
+        ctx.show_text(f"{high:.0f}%")
+        ctx.move_to(4, y_at(low))
+        ctx.show_text(f"{low:.0f}%")
+        ctx.move_to(left, height - 8)
+        ctx.show_text(history[0][0])
+        ext = ctx.text_extents(history[-1][0])
+        ctx.move_to(width - right - ext.width, height - 8)
+        ctx.show_text(history[-1][0])
+
+        ctx.set_source_rgb(*GREEN)
+        ctx.set_line_width(2)
+        ctx.new_path()  # drawing text leaves a current point the line would start from
+        for index, value in enumerate(values):
+            ctx.line_to(x_at(index), y_at(value))
+        ctx.stroke()
 
 
 class Row(Adw.ActionRow):
@@ -145,7 +203,50 @@ class Window(Adw.ApplicationWindow):
         for r in (self.r_cap, self.r_health, self.r_cycles):
             pack.add(r)
 
+        self.health_chart = HealthChart()
+        history_group = Adw.PreferencesGroup(title="Health history")
+        history_group.add(self.health_chart)
+
+        apps_group = Adw.PreferencesGroup(
+            title="Busiest apps",
+            description="CPU use, where 100% is one full core. A clue to battery drain, "
+                        "not an exact measure: the screen and graphics aren't counted.")
+        self.app_rows = []
+        for _ in range(APP_ROWS):
+            row = Row("")
+            row.set_use_markup(False)  # process names can contain any character
+            row.set_visible(False)
+            apps_group.add(row)
+            self.app_rows.append(row)
+        self.cpu_before = battlib.read_cpu_ticks()
+
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14,
+                       margin_top=8, margin_bottom=24, margin_start=16, margin_end=16)
+        body.append(self.gauge)
+        body.append(self.headline)
+        body.append(self.sub)
+        body.append(live)
+        body.append(apps_group)
+        body.append(pack)
+        body.append(history_group)
+
         cfg = battlib.load_config()
+        if battlib.snapshot(cfg).get("cap_limit") is not None:
+            body.append(self._limit_controls(cfg))
+
+        scroller = Gtk.ScrolledWindow(child=body, vexpand=True,
+                                      hscrollbar_policy=Gtk.PolicyType.NEVER)
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        root.append(Adw.HeaderBar(show_title=True))
+        root.append(scroller)
+        self.set_content(root)
+
+        self.refresh()
+        self.refresh_history()
+        GLib.timeout_add_seconds(REFRESH_SECONDS, self.refresh)
+        GLib.timeout_add_seconds(APPS_REFRESH_SECONDS, self.refresh_apps)
+
+    def _limit_controls(self, cfg):
         controls = Adw.PreferencesGroup(
             title="Charge limit",
             description="Enforced by the laptop's embedded controller, so it "
@@ -160,25 +261,21 @@ class Window(Adw.ApplicationWindow):
         controls.add(btn_row)
         self.status_label = Gtk.Label(css_classes=["dim-label", "caption"], wrap=True, xalign=0)
         controls.add(Adw.ActionRow(child=self.status_label))
+        return controls
 
-        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14,
-                       margin_top=8, margin_bottom=24, margin_start=16, margin_end=16)
-        body.append(self.gauge)
-        body.append(self.headline)
-        body.append(self.sub)
-        body.append(live)
-        body.append(pack)
-        body.append(controls)
+    def refresh_history(self):
+        self.health_chart.update(battlib.read_health_history())
 
-        scroller = Gtk.ScrolledWindow(child=body, vexpand=True,
-                                      hscrollbar_policy=Gtk.PolicyType.NEVER)
-        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        root.append(Adw.HeaderBar(show_title=True))
-        root.append(scroller)
-        self.set_content(root)
-
-        self.refresh()
-        GLib.timeout_add_seconds(REFRESH_SECONDS, self.refresh)
+    def refresh_apps(self):
+        after = battlib.read_cpu_ticks()
+        apps = battlib.busiest_apps(self.cpu_before, after, APPS_REFRESH_SECONDS, top=APP_ROWS)
+        self.cpu_before = after
+        for index, row in enumerate(self.app_rows):
+            row.set_visible(index < len(apps))
+            if index < len(apps):
+                row.set_title(apps[index][0])
+                row.set(f"{apps[index][1]:.0f}%")
+        return True
 
     def _set_limit(self, _btn, value):
         for cmd in (["sudo", "-n", LIMIT_TOOL, str(value)],
@@ -206,7 +303,14 @@ class Window(Adw.ApplicationWindow):
         fd = battlib.fmt_duration
         tmax, tmin = snap["target_max"], snap["target_min"]
 
-        if snap["charging"]:
+        if snap["charging"] and snap["cap_limit"] is None:
+            self.headline.set_label(f"Charging — alerts at {tmax}%")
+            self.sub.set_label("This laptop can't stop charging by itself. Unplug when the alert pings.")
+            self.r_eta.set_title(f"To {tmax}% target")
+            self.r_eta.set(fd(snap["seconds_to_target"]))
+            self.r_secondary.set_title("To 100%")
+            self.r_secondary.set(fd(snap["seconds_to_full"]))
+        elif snap["charging"]:
             self.headline.set_label(f"Charging to the {tmax}% cap")
             self.sub.set_label(f"Then charging stops on its own — nothing to unplug.")
             self.r_eta.set_title(f"To {tmax}% cap")
@@ -221,11 +325,17 @@ class Window(Adw.ApplicationWindow):
             self.r_secondary.set_title(f"To {tmin}% floor")
             self.r_secondary.set(fd(snap["seconds_to_floor"]))
         else:
-            self.headline.set_label(f"Holding at {snap['percent']}%")
-            self.sub.set_label(f"The {snap['cap_limit']}% EC limit stopped charging. "
-                               "This is the healthiest state to sit in on AC.")
-            self.r_eta.set_title("Charging")
-            self.r_eta.set("stopped at cap")
+            if snap["cap_limit"] is None:
+                self.headline.set_label(f"Plugged in at {snap['percent']}%")
+                self.sub.set_label("Plugged in and not charging.")
+                self.r_eta.set_title("Charging")
+                self.r_eta.set("not charging")
+            else:
+                self.headline.set_label(f"Holding at {snap['percent']}%")
+                self.sub.set_label(f"The {snap['cap_limit']}% EC limit stopped charging. "
+                                   "This is the healthiest state to sit in on AC.")
+                self.r_eta.set_title("Charging")
+                self.r_eta.set("stopped at cap")
             self.r_secondary.set_title("Runtime if unplugged")
             self.r_secondary.set(fd(snap["seconds_to_empty"]) if snap["seconds_to_empty"] else "--")
 
@@ -234,7 +344,10 @@ class Window(Adw.ApplicationWindow):
             self.r_energy.set(f"{snap['energy_now_wh']:.1f} / {snap['energy_full_wh']:.1f} Wh")
 
         cap = snap["cap_limit"]
-        self.r_cap.set(f"{cap}%" + ("" if snap["cap_applied"] else f"  (target {tmax}%)"))
+        if cap is None:
+            self.r_cap.set(f"Not available, alerts at {tmax}%")
+        else:
+            self.r_cap.set(f"{cap}%" + ("" if snap["cap_applied"] else f"  (target {tmax}%)"))
         self.r_health.set(f"{snap['health_pct']:.1f}%" if snap["health_pct"] is not None else "--")
         design = snap["energy_design_wh"]
         if design:

@@ -5,5 +5,7 @@
   "notify_full": true,
   "notify_cap_drift": true,
   "poll_seconds": 20,
-  "sound": true
+  "sound": true,
+  "plug_sounds": true,
+  "reminder_minutes": 5
 }

@@ -3,7 +3,7 @@
 # not left with a capped battery and no tool to change it.
 #
 #   ./uninstall.sh              remove everything, keep your config
-#   ./uninstall.sh --purge      also delete ~/.config/battery-guard
+#   ./uninstall.sh --purge      also delete your config and health history
 set -euo pipefail
 
 PURGE=0
@@ -29,10 +29,10 @@ update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
 ok "commands, library, services and menu entries removed"
 
 if [ "$PURGE" = 1 ]; then
-    rm -rf "$HOME/.config/battery-guard"
-    ok "config removed"
+    rm -rf "$HOME/.config/battery-guard" "${XDG_STATE_HOME:-$HOME/.local/state}/battery-guard"
+    ok "config and health history removed"
 else
-    ok "config kept at ~/.config/battery-guard (use --purge to delete)"
+    ok "config and health history kept (use --purge to delete)"
 fi
 
 if [ -e /etc/systemd/system/battery-charge-limit.service ]; then

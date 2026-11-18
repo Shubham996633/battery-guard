@@ -56,6 +56,7 @@ python3 -c "import gi" 2>/dev/null || MISSING+=("python3-gi")
 python3 -c "import gi; gi.require_version('Gtk','4.0')" 2>/dev/null || MISSING+=("libgtk-4-1 gir1.2-gtk-4.0")
 python3 -c "import gi; gi.require_version('Adw','1')" 2>/dev/null || MISSING+=("gir1.2-adw-1")
 python3 -c "import gi; gi.require_version('AyatanaAppIndicator3','0.1')" 2>/dev/null \
+    || python3 -c "import gi; gi.require_version('AppIndicator3','0.1')" 2>/dev/null \
     || MISSING+=("gir1.2-ayatanaappindicator3-0.1")
 
 if [ ${#MISSING[@]} -gt 0 ]; then

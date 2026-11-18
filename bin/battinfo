@@ -4,11 +4,14 @@
   battinfo           pretty readout
   battinfo --panel   one compact line, e.g. "85% 4:28 to empty"
   battinfo --json    machine readable
+  battinfo --history battery health over time
+  battinfo --apps    which apps are working the CPU hardest right now
 """
 
 import json
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.expanduser("~/.local/lib/battery-guard"))
 import battlib  # noqa: E402
@@ -49,8 +52,46 @@ def bar(percent, target_max, width=28):
     return "".join(cells)
 
 
+def show_history():
+    history = battlib.read_health_history()
+    if not history:
+        print("No health history yet. Battery Guard saves one reading a day while it runs.")
+        return
+    first_date, first = history[0]
+    last_date, last = history[-1]
+    print(f"\n  {C['bold']}Health{C['reset']}   {last:.1f}%   {C['dim']}on {last_date}{C['reset']}")
+    if len(history) == 1:
+        print(f"  {C['dim']}One reading so far. A trend appears after a few days.{C['reset']}\n")
+        return
+    print(f"  {C['bold']}Change{C['reset']}   {last - first:+.1f}%   {C['dim']}since {first_date}, "
+          f"{len(history)} readings{C['reset']}")
+    print(f"  {C['bold']}Trend{C['reset']}    {C['cyan']}{battlib.sparkline([v for _, v in history[-60:]])}{C['reset']}")
+    print(f"  {C['dim']}Readings move up and down a little day to day. Look at the long trend.{C['reset']}\n")
+
+
+def show_apps(seconds=3):
+    print(f"Measuring for {seconds} seconds...")
+    before = battlib.read_cpu_ticks()
+    time.sleep(seconds)
+    apps = battlib.busiest_apps(before, battlib.read_cpu_ticks(), seconds)
+    print()
+    for name, percent in apps:
+        print(f"  {percent:6.1f}%  {name}")
+    if not apps:
+        print("  Nothing is using the CPU.")
+    print(f"\n  {C['dim']}100% is one full CPU core. CPU use is a clue to battery drain, not an exact")
+    print(f"  measure: the screen, graphics chip and network aren't counted.{C['reset']}\n")
+
+
 def main():
     args = sys.argv[1:]
+    if "--history" in args:
+        show_history()
+        return 0
+    if "--apps" in args:
+        show_apps()
+        return 0
+
     snap = battlib.snapshot()
 
     if not snap.get("present"):
@@ -70,14 +111,18 @@ def main():
             print(f"{p}% ↑ {battlib.fmt_clock(eta)} to {snap['target_max']}%")
         elif snap["discharging"]:
             print(f"{p}% ↓ {battlib.fmt_clock(snap['seconds_to_empty'])} to empty")
+        elif snap["cap_limit"] is None:
+            print(f"{p}% · plugged in")
         else:
             print(f"{p}% · holding at cap")
         return 0
 
     col = level_color(snap)
+    has_cap = snap["cap_limit"] is not None
+    goal = "cap" if has_cap else "target"
     print()
     print(f"  {col}{C['bold']}{p}%{C['reset']}  {col}{bar(p, snap['target_max'])}{C['reset']}"
-          f"  {C['dim']}(| = {snap['target_max']}% cap){C['reset']}")
+          f"  {C['dim']}(| = {snap['target_max']}% {goal}){C['reset']}")
     print()
 
     watts = f"{snap['power_w']:.1f} W" if snap["power_w"] else "--"
@@ -85,18 +130,24 @@ def main():
           f"{'  (on AC)' if snap['ac_online'] else '  (on battery)'}   {C['dim']}{watts}{C['reset']}")
 
     if snap["charging"]:
-        print(f"  {C['bold']}To {snap['target_max']}% cap{C['reset']}  "
+        print(f"  {C['bold']}To {snap['target_max']}% {goal}{C['reset']}  "
               f"{C['cyan']}{fd(snap['seconds_to_target'])}{C['reset']}"
               f"   {C['dim']}(to 100%: {fd(snap['seconds_to_full'])}){C['reset']}")
     elif snap["discharging"]:
         print(f"  {C['bold']}To empty{C['reset']}     {col}{fd(snap['seconds_to_empty'])}{C['reset']}")
         print(f"  {C['bold']}To {snap['target_min']}% floor{C['reset']} "
               f"{fd(snap['seconds_to_floor'])}   {C['dim']}(plug in around then){C['reset']}")
-    else:
+    elif has_cap:
         print(f"  {C['bold']}Charging{C['reset']}     stopped by the {snap['cap_limit']}% EC limit")
+    else:
+        print(f"  {C['bold']}Charging{C['reset']}     not charging")
 
-    cap_state = (f"{C['green']}{snap['cap_limit']}% enforced{C['reset']}" if snap["cap_applied"]
-                 else f"{C['yellow']}{snap['cap_limit']}% (config wants {snap['target_max']}%){C['reset']}")
+    if not has_cap:
+        cap_state = f"{C['yellow']}not available on this laptop (alerts at {snap['target_max']}%){C['reset']}"
+    elif snap["cap_applied"]:
+        cap_state = f"{C['green']}{snap['cap_limit']}% enforced{C['reset']}"
+    else:
+        cap_state = f"{C['yellow']}{snap['cap_limit']}% (config wants {snap['target_max']}%){C['reset']}"
     print(f"  {C['bold']}Charge cap{C['reset']}   {cap_state}")
 
     if snap["health_pct"] is not None:

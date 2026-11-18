@@ -2,11 +2,17 @@
 """battery-guardd - desktop notifications for battery limits.
 
 Runs as a user systemd service. Notifies on the way down (configurable
-steps, default 20/15/10/5) and once when charging reaches the cap.
+steps, default 20/15/10/5) and when charging reaches the cap.
 Each channel reuses one notification id so nothing stacks up, and every
 alert has hysteresis so it cannot re-fire while hovering on a boundary.
+
+Two situations repeat every reminder_minutes until they are dealt with:
+charging past the target with no firmware limit to stop it, and a critically
+low battery. `battery-guardd --test` sends a sample alert and sound.
+Also adds one line a day to the battery health history.
 """
 
+import datetime
 import os
 import shutil
 import subprocess
@@ -18,14 +24,18 @@ import battlib  # noqa: E402
 
 APP = "Battery Guard"
 HYSTERESIS = 3  # percent you must climb back above before a step re-arms
+CRITICAL_PERCENT = 10  # at or below this, low-battery alerts keep repeating
 
 SOUND_FILES = {
     "warning": "/usr/share/sounds/freedesktop/stereo/dialog-warning.oga",
     "done": "/usr/share/sounds/freedesktop/stereo/complete.oga",
+    "plug": "/usr/share/sounds/freedesktop/stereo/power-plug.oga",
+    "unplug": "/usr/share/sounds/freedesktop/stereo/power-unplug.oga",
 }
 
 _notify_ids = {}
 _player = None
+_sound_on = True
 
 
 def log(message):
@@ -49,7 +59,7 @@ def find_player():
 
 def play(kind):
     path = SOUND_FILES.get(kind)
-    if not _player or not path or not os.path.exists(path):
+    if not _sound_on or not _player or not path or not os.path.exists(path):
         return
     try:
         subprocess.Popen(_player(path), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -80,60 +90,101 @@ def low_urgency(step, floor):
     return "critical" if step <= max(10, floor // 2) else "normal"
 
 
+def low_message(level, percent, eta):
+    if level <= 5:
+        return f"Battery critical - {percent}%", f"About {eta} left. Plug in now."
+    return (f"Battery low - {percent}%",
+            f"About {eta} left before empty. Charge to protect the cells.")
+
+
+def send_test_alert():
+    notify("test", "Battery Guard test", "Alerts and sound are working.",
+           "battery-caution-symbolic", sound="warning")
+
+
 def main():
-    global _player
+    global _player, _sound_on
     _player = find_player()
+
+    if "--test" in sys.argv[1:]:
+        send_test_alert()
+        return
 
     fired_low = set()
     fired_full = False
     fired_drift = False
     last_status = None
+    last_ac = None
+    last_low_alert = None
+    last_full_alert = None
 
     while True:
         cfg = battlib.load_config()
+        _sound_on = bool(cfg["sound"])
         snap = battlib.snapshot(cfg)
         if not snap.get("present"):
             time.sleep(60)
             continue
 
+        battlib.record_health(snap, datetime.date.today().isoformat())
+
         p = snap["percent"] or 0
-        tmax, tmin = snap["target_max"], snap["target_min"]
+        tmax = snap["target_max"]
         fd = battlib.fmt_duration
+        now = time.monotonic()
+        reminder_minutes = cfg["reminder_minutes"]
+
+        # --- charger plugged in or pulled out ----------------------------
+        ac = snap["ac_online"]
+        if cfg["plug_sounds"] and last_ac is not None and ac != last_ac:
+            play("plug" if ac else "unplug")
+        last_ac = ac
 
         # --- the way down -------------------------------------------------
         if snap["discharging"]:
             fired_full = False
+            last_full_alert = None
             for step in cfg["low_steps"]:
                 if p <= step and step not in fired_low:
-                    eta = fd(snap["seconds_to_empty"])
-                    if step <= 5:
-                        title = f"Battery critical - {p}%"
-                        body = f"About {eta} left. Plug in now."
-                    else:
-                        title = f"Battery low - {p}%"
-                        body = f"About {eta} left before empty. Charge to protect the cells."
+                    title, body = low_message(step, p, fd(snap["seconds_to_empty"]))
                     notify("low", title, body, "battery-caution-symbolic",
-                           low_urgency(step, tmin), sound="warning")
+                           low_urgency(step, snap["target_min"]), sound="warning")
                     fired_low.add(step)
+                    last_low_alert = now
             # Re-arm a step only once we are comfortably back above it.
             fired_low = {s for s in fired_low if p <= s + HYSTERESIS}
+            if p <= CRITICAL_PERCENT and battlib.reminder_due(last_low_alert, now, reminder_minutes):
+                title, body = low_message(p, p, fd(snap["seconds_to_empty"]))
+                notify("low", title, body, "battery-caution-symbolic", "critical", sound="warning")
+                last_low_alert = now
 
         # --- the way up ---------------------------------------------------
         elif snap["charging"] or snap["holding"]:
             fired_low.clear()
-            if cfg["notify_full"] and battlib.cap_reached(snap) and not fired_full:
-                if snap["cap_applied"]:
-                    title = f"Battery at {p}% - charging stopped"
-                    near = "" if p >= tmax else " Firmware terminates a little under the setpoint."
-                    body = f"The {tmax}% limit is holding.{near} Safe to leave plugged in."
-                else:
-                    title = f"Battery at {p}% - unplug"
-                    body = f"At or above your {tmax}% target and the firmware limit is not enforcing it."
-                notify("full", title, body, "battery-full-charged-symbolic",
-                       "normal" if snap["cap_applied"] else "critical", sound="done")
-                fired_full = True
+            last_low_alert = None
+            if cfg["notify_full"] and battlib.cap_reached(snap):
+                holding_at_cap = snap["cap_applied"]
+                keep_reminding = (not holding_at_cap
+                                  and battlib.reminder_due(last_full_alert, now, reminder_minutes))
+                if not fired_full or keep_reminding:
+                    if holding_at_cap:
+                        title = f"Battery at {p}% - charging stopped"
+                        near = "" if p >= tmax else " Firmware terminates a little under the setpoint."
+                        body = f"The {tmax}% limit is holding.{near} Safe to leave plugged in."
+                    elif snap["cap_limit"] is None:
+                        title = f"Battery at {p}% - unplug"
+                        body = f"Past your {tmax}% target. This laptop can't stop charging by itself."
+                    else:
+                        title = f"Battery at {p}% - unplug"
+                        body = f"At or above your {tmax}% target and the firmware limit is not enforcing it."
+                    notify("full", title, body, "battery-full-charged-symbolic",
+                           "normal" if holding_at_cap else "critical",
+                           sound="done" if holding_at_cap else "warning")
+                    fired_full = True
+                    last_full_alert = now
             if p < tmax - HYSTERESIS:
                 fired_full = False
+                last_full_alert = None
 
         # --- the cap itself slipped --------------------------------------
         drift = cfg["notify_cap_drift"] and snap["cap_limit"] is not None and not snap["cap_applied"]
